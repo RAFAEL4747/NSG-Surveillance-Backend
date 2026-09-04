@@ -11,3 +11,5 @@ scikit-learn
 reportlab==4.2.2
 aiofiles==24.1.0
 pillow==10.4.0
+ultralytics
+openai-whisper
