@@ -1,20 +1,19 @@
 """
-Audio Analysis Engine
+FAST Audio Analysis Engine
+Designed for low-CPU Render deployments.
 
-KEY PRINCIPLE:
-Only report real detections. If Whisper is unavailable, we report that
-transcription is unavailable — we never invent transcript content.
-
-Performance:
-- Whisper uses the tiny model.
-- Whisper is loaded lazily, only when transcription is needed.
-- Whisper is cached between jobs during the lifetime of the server.
-- Speaker analysis is limited to 5 minutes and uses a larger hop length.
-- CPU-safe Whisper settings are used for Render.
+Principles:
+- Never process unlimited audio.
+- Audio is converted to 16 kHz mono.
+- Maximum audio analysis duration is 120 seconds.
+- Whisper tiny is loaded once per server.
+- Speaker clustering is disabled because it is too expensive on Render Free.
+- Only report real detections.
 """
 
 import os
 import logging
+import tempfile
 import numpy as np
 from typing import Callable
 
@@ -30,65 +29,69 @@ from core.schemas import (
 logger = logging.getLogger(__name__)
 
 
+# HARD LIMIT FOR RENDER
+MAX_AUDIO_SECONDS = 120
+
+# Whisper tiny is intentionally used
+WHISPER_MODEL = "tiny"
+
+
 def _ts(sec: float) -> str:
-    """Convert seconds to HH:MM:SS."""
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
     s = int(sec % 60)
-
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 class AudioAnalyzer:
 
     # ---------------------------------------------------------
-    # Whisper is shared between jobs.
-    # This prevents loading the model repeatedly.
+    # LOAD WHISPER ONLY ONCE PER SERVER
     # ---------------------------------------------------------
+
     _whisper_model = None
     _whisper_attempted = False
 
     def __init__(self):
+
         self.whisper = None
 
         self.capabilities = {
-            "transcription": True
+            "transcription": False,
+            "gunshot_detection": True,
+            "speaker_identification": False,
         }
 
-    # ---------------------------------------------------------
-    # LOAD WHISPER
-    # ---------------------------------------------------------
-    def _load_whisper(self):
-        """
-        Load Whisper only once per running server.
+        self._load_whisper_once()
 
-        The model is NOT loaded when AudioAnalyzer is created.
-        It is loaded only when transcription is actually required.
-        """
+    def _load_whisper_once(self):
 
-        # Already attempted during this server session
         if AudioAnalyzer._whisper_attempted:
+
             self.whisper = AudioAnalyzer._whisper_model
 
-            if self.whisper is None:
-                self.capabilities["transcription"] = False
+            if self.whisper is not None:
+                self.capabilities["transcription"] = True
 
             return
 
         AudioAnalyzer._whisper_attempted = True
 
         try:
+
             import whisper
 
-            logger.info("Loading Whisper tiny model...")
+            logger.info("Loading Whisper tiny...")
 
-            AudioAnalyzer._whisper_model = whisper.load_model("tiny")
+            AudioAnalyzer._whisper_model = whisper.load_model(
+                WHISPER_MODEL
+            )
 
             self.whisper = AudioAnalyzer._whisper_model
 
             self.capabilities["transcription"] = True
 
-            logger.info("Whisper tiny model loaded successfully")
+            logger.info("Whisper tiny loaded successfully")
 
         except Exception as e:
 
@@ -99,12 +102,14 @@ class AudioAnalyzer:
             self.capabilities["transcription_reason"] = str(e)
 
             logger.warning(
-                f"Whisper unavailable: {e}"
+                "Whisper unavailable: %s",
+                e
             )
 
     # ---------------------------------------------------------
-    # MAIN AUDIO ANALYSIS
+    # MAIN ANALYSIS
     # ---------------------------------------------------------
+
     def analyse(
         self,
         audio_path: str,
@@ -113,49 +118,46 @@ class AudioAnalyzer:
 
         import librosa
 
-        # -----------------------------------------------------
-        # AUDIO INGESTION
-        # -----------------------------------------------------
         if progress_cb:
             progress_cb(
                 62,
                 "Loading audio..."
             )
 
+        # -----------------------------------------------------
+        # FAST AUDIO LOAD
+        # -----------------------------------------------------
+
         try:
+
+            # IMPORTANT:
+            # 16 kHz mono is dramatically cheaper than
+            # preserving the original sample rate.
+
             y, sr = librosa.load(
                 audio_path,
-                sr=None,
-                mono=True
-            )
-
-            duration = librosa.get_duration(
-                y=y,
-                sr=sr
+                sr=16000,
+                mono=True,
+                duration=MAX_AUDIO_SECONDS
             )
 
         except Exception as e:
 
-            logger.error(
+            logger.exception(
+                "Audio loading failed"
+            )
+
+            return self._empty_result(
                 f"Audio loading failed: {e}"
             )
 
-            return {
-                "alerts": [],
-                "timeline": [],
-                "audio_anomalies": [],
-                "transcript": "",
-                "summary_stats": {
-                    "audio_anomalies": 0,
-                    "speakers_detected": 0,
-                    "duration_sec": 0,
-                },
-                "capabilities": {
-                    "transcription": False,
-                    "audio_loading": False,
-                    "audio_loading_reason": str(e),
-                },
-            }
+        duration = len(y) / sr
+
+        logger.info(
+            "Audio loaded: %.1f seconds @ %d Hz",
+            duration,
+            sr
+        )
 
         alerts = []
         timeline = []
@@ -164,71 +166,81 @@ class AudioAnalyzer:
         transcript = ""
 
         # -----------------------------------------------------
-        # 1. GUNSHOT / IMPULSE DETECTION
+        # 1. GUNSHOT DETECTION
         # -----------------------------------------------------
+
         if progress_cb:
             progress_cb(
                 66,
                 "Gunshot detection..."
             )
 
-        gs = self._detect_impulses(
-            y,
-            sr
-        )
+        try:
 
-        alerts.extend(
-            gs["alerts"]
-        )
+            gs = self._detect_impulses_fast(
+                y,
+                sr
+            )
 
-        timeline.extend(
-            gs["timeline"]
-        )
+            alerts.extend(gs["alerts"])
+            timeline.extend(gs["timeline"])
+            anomalies.extend(gs["anomalies"])
 
-        anomalies.extend(
-            gs["anomalies"]
-        )
+        except Exception as e:
+
+            logger.warning(
+                "Gunshot detection failed: %s",
+                e
+            )
 
         # -----------------------------------------------------
-        # 2. SPEECH TRANSCRIPTION
+        # 2. WHISPER
         # -----------------------------------------------------
+
         if progress_cb:
             progress_cb(
                 73,
                 "Speech transcription..."
             )
 
-        # Load Whisper only now.
-        self._load_whisper()
-
         if self.whisper:
 
-            transcript, t_tl = self._transcribe(
-                audio_path
-            )
+            try:
 
-            timeline.extend(
-                t_tl
-            )
+                transcript, speech_timeline = (
+                    self._transcribe_fast(
+                        y,
+                        sr
+                    )
+                )
+
+                timeline.extend(
+                    speech_timeline
+                )
+
+            except Exception as e:
+
+                logger.warning(
+                    "Whisper failed: %s",
+                    e
+                )
 
         else:
-
-            transcript = ""
 
             timeline.append(
                 TimelineEvent(
                     timestamp="00:00:00",
                     source=AlertType.AUDIO,
                     event=(
-                        "[Transcription unavailable — "
-                        "Whisper could not be loaded]"
-                    ),
+                        "[Speech transcription unavailable]"
+                    )
                 )
             )
 
         # -----------------------------------------------------
-        # 3. KEYWORD SCAN
+        # 3. KEYWORDS
         # -----------------------------------------------------
+
         if progress_cb:
             progress_cb(
                 82,
@@ -256,51 +268,67 @@ class AudioAnalyzer:
         # -----------------------------------------------------
         # 4. SPEAKER IDENTIFICATION
         # -----------------------------------------------------
+
         if progress_cb:
             progress_cb(
                 88,
-                "Speaker identification..."
+                "Finishing audio analysis..."
             )
 
-        sp = self._speaker_id(
-            y,
-            sr,
-            duration
-        )
+        # DISABLED FOR FAST RENDER MODE.
+        #
+        # KMeans over every MFCC frame can become extremely
+        # expensive on CPU-only Render instances.
 
-        timeline.extend(
-            sp["timeline"]
-        )
-
-        anomalies.extend(
-            sp["anomalies"]
+        logger.info(
+            "Speaker identification skipped "
+            "in FAST mode"
         )
 
         # -----------------------------------------------------
-        # FINAL RESULT
+        # RETURN
         # -----------------------------------------------------
+
+        if progress_cb:
+            progress_cb(
+                94,
+                "Audio analysis complete..."
+            )
+
         return {
+
             "alerts": alerts,
+
             "timeline": timeline,
+
             "audio_anomalies": anomalies,
+
             "transcript": transcript,
 
             "summary_stats": {
-                "audio_anomalies": len(anomalies),
-                "speakers_detected": sp["count"],
-                "duration_sec": round(
-                    duration,
-                    1
-                ),
+
+                "audio_anomalies":
+                    len(anomalies),
+
+                "speakers_detected":
+                    0,
+
+                "duration_sec":
+                    round(
+                        duration,
+                        1
+                    ),
             },
 
-            "capabilities": self.capabilities,
+            "capabilities":
+                self.capabilities,
         }
 
     # ---------------------------------------------------------
-    # GUNSHOT / IMPULSE DETECTION
+    # FAST IMPULSE DETECTION
     # ---------------------------------------------------------
-    def _detect_impulses(
+
+    def _detect_impulses_fast(
         self,
         y,
         sr
@@ -312,36 +340,40 @@ class AudioAnalyzer:
         timeline = []
         anomalies = []
 
-        # Make sure chunk is an integer.
-        chunk = int(
-            settings.AUDIO_CHUNK_SEC * sr
+        # Larger chunks = fewer expensive librosa calls
+        chunk_seconds = 5
+
+        chunk_samples = (
+            chunk_seconds * sr
         )
 
-        if chunk <= 0:
-            chunk = int(sr)
-
-        n_chunks = len(y) // chunk
+        n_chunks = int(
+            np.ceil(
+                len(y) /
+                chunk_samples
+            )
+        )
 
         for i in range(n_chunks):
 
-            start = i * chunk
-            end = (i + 1) * chunk
+            start = int(
+                i * chunk_samples
+            )
+
+            end = int(
+                min(
+                    len(y),
+                    start + chunk_samples
+                )
+            )
 
             seg = y[start:end]
 
-            t = (
-                i *
-                settings.AUDIO_CHUNK_SEC
-            )
-
-            ts = _ts(t)
-
-            if len(seg) == 0:
+            if len(seg) < sr * 0.25:
                 continue
 
-            # -------------------------------------------------
-            # RMS
-            # -------------------------------------------------
+            t = start / sr
+
             rms = float(
                 np.sqrt(
                     np.mean(
@@ -359,36 +391,23 @@ class AudioAnalyzer:
                 + 96
             )
 
-            # -------------------------------------------------
-            # ONSET
-            # -------------------------------------------------
-            try:
-
-                onset_env = (
-                    librosa.onset.onset_strength(
-                        y=seg,
-                        sr=sr
-                    )
+            # Cheap onset calculation
+            onset_env = (
+                librosa.onset.onset_strength(
+                    y=seg,
+                    sr=sr,
+                    hop_length=1024
                 )
+            )
 
-                if len(onset_env) == 0:
-                    continue
-
-                peak_onset = float(
-                    np.max(onset_env)
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    f"Onset detection failed: {e}"
-                )
-
+            if len(onset_env) == 0:
                 continue
 
-            # -------------------------------------------------
-            # GUNSHOT DETECTION
-            # -------------------------------------------------
+            peak_onset = float(
+                np.max(onset_env)
+            )
+
+            # Conservative detection
             if (
                 db >
                 settings.GUNSHOT_DB_THRESHOLD
@@ -397,134 +416,78 @@ class AudioAnalyzer:
                 settings.GUNSHOT_ONSET_THRESHOLD
             ):
 
-                try:
+                conf = min(
+                    0.95,
+                    0.60
+                    +
+                    (
+                        db -
+                        settings.GUNSHOT_DB_THRESHOLD
+                    ) / 40
+                    +
+                    (
+                        peak_onset -
+                        settings.GUNSHOT_ONSET_THRESHOLD
+                    ) / 60
+                )
 
-                    onset_frames = (
-                        librosa.onset.onset_detect(
-                            y=seg,
-                            sr=sr
-                        )
+                severity = (
+                    SeverityLevel.HIGH
+                    if conf > 0.80
+                    else SeverityLevel.MEDIUM
+                )
+
+                timestamp = _ts(t)
+
+                alerts.append(
+                    Alert(
+                        timestamp=timestamp,
+                        severity=severity,
+                        alert_type=AlertType.AUDIO,
+                        category="gunshot_detected",
+                        description=(
+                            f"Possible acoustic impulse "
+                            f"at {timestamp} "
+                            f"(dB {db:.1f}, "
+                            f"confidence {conf:.0%})"
+                        ),
+                        confidence=round(
+                            conf,
+                            2
+                        ),
                     )
+                )
 
-                except Exception:
-
-                    onset_frames = []
-
-                # Single sharp transient
-                if len(onset_frames) <= 2:
-
-                    conf = min(
-                        0.95,
-                        0.60
-                        +
-                        (
-                            db
-                            -
-                            settings.GUNSHOT_DB_THRESHOLD
-                        ) / 40
-                        +
-                        (
-                            peak_onset
-                            -
-                            settings.GUNSHOT_ONSET_THRESHOLD
-                        ) / 60
+                timeline.append(
+                    TimelineEvent(
+                        timestamp=timestamp,
+                        source=AlertType.AUDIO,
+                        event=(
+                            f"Acoustic impulse — "
+                            f"possible gunshot "
+                            f"({conf:.0%})"
+                        ),
+                        confidence=round(
+                            conf,
+                            2
+                        ),
                     )
+                )
 
-                    sev = (
-                        SeverityLevel.HIGH
-                        if conf > 0.80
-                        else SeverityLevel.MEDIUM
+                anomalies.append(
+                    AudioAnomaly(
+                        timestamp=timestamp,
+                        anomaly_type="gunshot",
+                        confidence=round(
+                            conf,
+                            2
+                        ),
+                        detail=(
+                            f"dB:{db:.1f} "
+                            f"onset:{peak_onset:.1f}"
+                        ),
                     )
-
-                    alerts.append(
-                        Alert(
-                            timestamp=ts,
-                            severity=sev,
-                            alert_type=AlertType.AUDIO,
-                            category="gunshot_detected",
-                            description=(
-                                f"Impulse event at {ts}: "
-                                f"possible gunshot/explosion "
-                                f"(dB {db:.1f}, "
-                                f"onset {peak_onset:.1f}, "
-                                f"conf {conf:.0%})"
-                            ),
-                            confidence=round(
-                                conf,
-                                2
-                            ),
-                        )
-                    )
-
-                    timeline.append(
-                        TimelineEvent(
-                            timestamp=ts,
-                            source=AlertType.AUDIO,
-                            event=(
-                                "Acoustic impulse — "
-                                f"possible gunshot "
-                                f"({conf:.0%})"
-                            ),
-                            confidence=round(
-                                conf,
-                                2
-                            ),
-                        )
-                    )
-
-                    anomalies.append(
-                        AudioAnomaly(
-                            timestamp=ts,
-                            anomaly_type="gunshot",
-                            confidence=round(
-                                conf,
-                                2
-                            ),
-                            detail=(
-                                f"dB:{db:.1f} "
-                                f"onset:{peak_onset:.1f} "
-                                f"transients:"
-                                f"{len(onset_frames)}"
-                            ),
-                        )
-                    )
-
-            # -------------------------------------------------
-            # SUSTAINED LOUD AUDIO
-            # -------------------------------------------------
-            elif (
-                db > 78
-                and
-                peak_onset > 6.0
-            ):
-
-                try:
-
-                    onset_frames = (
-                        librosa.onset.onset_detect(
-                            y=seg,
-                            sr=sr
-                        )
-                    )
-
-                except Exception:
-
-                    onset_frames = []
-
-                if len(onset_frames) > 3:
-
-                    anomalies.append(
-                        AudioAnomaly(
-                            timestamp=ts,
-                            anomaly_type="elevated_audio",
-                            confidence=0.55,
-                            detail=(
-                                f"Sustained loud audio "
-                                f"at {ts} "
-                                f"(dB {db:.1f})"
-                            ),
-                        )
-                    )
+                )
 
         return {
             "alerts": alerts,
@@ -533,11 +496,13 @@ class AudioAnalyzer:
         }
 
     # ---------------------------------------------------------
-    # WHISPER TRANSCRIPTION
+    # FAST WHISPER
     # ---------------------------------------------------------
-    def _transcribe(
+
+    def _transcribe_fast(
         self,
-        path
+        y,
+        sr
     ):
 
         timeline = []
@@ -547,24 +512,17 @@ class AudioAnalyzer:
 
         try:
 
-            logger.info(
-                "Starting Whisper tiny transcription..."
-            )
+            # Whisper accepts a numpy waveform.
+            # No temporary MP3/WAV conversion required.
 
             result = self.whisper.transcribe(
-                path,
-
-                # English is faster than automatic
-                # language detection.
+                y,
                 language="en",
-
-                word_timestamps=False,
-
-                # Render CPU-safe setting.
                 fp16=False,
-
-                # Avoid unnecessary verbose output.
+                temperature=0,
                 verbose=False,
+                condition_on_previous_text=False,
+                word_timestamps=False
             )
 
             text = (
@@ -573,62 +531,50 @@ class AudioAnalyzer:
                 .strip()
             )
 
-            # -------------------------------------------------
-            # Add real speech segments to timeline.
-            # -------------------------------------------------
             for seg in result.get(
                 "segments",
                 []
             ):
 
-                if (
-                    seg.get(
-                        "no_speech_prob",
-                        1.0
-                    )
-                    < 0.5
-                ):
+                no_speech = seg.get(
+                    "no_speech_prob",
+                    1.0
+                )
 
-                    ts = _ts(
-                        seg["start"]
-                    )
+                if no_speech < 0.5:
 
                     timeline.append(
                         TimelineEvent(
-                            timestamp=ts,
+                            timestamp=_ts(
+                                seg["start"]
+                            ),
                             source=AlertType.AUDIO,
                             event=(
-                                f'Speech: '
+                                "Speech: "
                                 f'"{seg["text"].strip()}"'
                             ),
                             confidence=round(
-                                1 -
-                                seg.get(
-                                    "no_speech_prob",
-                                    0
-                                ),
+                                1 - no_speech,
                                 2
                             ),
                         )
                     )
 
-            logger.info(
-                "Whisper transcription completed"
-            )
-
             return text, timeline
 
         except Exception as e:
 
-            logger.error(
-                f"Transcription error: {e}"
+            logger.warning(
+                "Whisper transcription failed: %s",
+                e
             )
 
-            return "", []
+            return "", timeline
 
     # ---------------------------------------------------------
     # KEYWORD SCAN
     # ---------------------------------------------------------
+
     def _keyword_scan(
         self,
         transcript
@@ -638,36 +584,29 @@ class AudioAnalyzer:
         timeline = []
         anomalies = []
 
-        words = (
-            transcript
-            .lower()
-            .split()
+        words = set(
+            transcript.lower().split()
         )
 
         matched = [
             kw
             for kw in settings.THREAT_KEYWORDS
-            if kw in words
+            if kw.lower() in words
         ]
 
         if matched:
 
             n = len(matched)
 
-            # 1 keyword = LOW
-            # 2-3 keywords = MEDIUM
-            # 4+ keywords = HIGH
-            sev = (
+            severity = (
                 SeverityLevel.HIGH
                 if n >= 4
-                else
-                SeverityLevel.MEDIUM
+                else SeverityLevel.MEDIUM
                 if n >= 2
-                else
-                SeverityLevel.LOW
+                else SeverityLevel.LOW
             )
 
-            conf = min(
+            confidence = min(
                 0.92,
                 0.50 + n * 0.10
             )
@@ -675,15 +614,14 @@ class AudioAnalyzer:
             alerts.append(
                 Alert(
                     timestamp="00:00:00",
-                    severity=sev,
+                    severity=severity,
                     alert_type=AlertType.AUDIO,
                     category="keyword_alert",
                     description=(
                         "Threat keywords in transcript: "
-                        +
-                        ", ".join(matched)
+                        + ", ".join(matched)
                     ),
-                    confidence=conf,
+                    confidence=confidence,
                 )
             )
 
@@ -693,8 +631,7 @@ class AudioAnalyzer:
                     source=AlertType.AUDIO,
                     event=(
                         "Keywords matched: "
-                        +
-                        ", ".join(matched)
+                        + ", ".join(matched)
                     ),
                 )
             )
@@ -703,11 +640,10 @@ class AudioAnalyzer:
                 AudioAnomaly(
                     timestamp="00:00:00",
                     anomaly_type="keyword",
-                    confidence=conf,
+                    confidence=confidence,
                     detail=(
                         f"Matched {n} keyword(s): "
-                        +
-                        ", ".join(matched)
+                        + ", ".join(matched)
                     ),
                 )
             )
@@ -719,233 +655,36 @@ class AudioAnalyzer:
         }
 
     # ---------------------------------------------------------
-    # SPEAKER IDENTIFICATION
+    # EMPTY RESULT
     # ---------------------------------------------------------
-    def _speaker_id(
+
+    def _empty_result(
         self,
-        y,
-        sr,
-        duration
+        reason
     ):
 
-        timeline = []
-        anomalies = []
+        return {
 
-        try:
+            "alerts": [],
 
-            import librosa
-
-            from sklearn.cluster import KMeans
-            from sklearn.preprocessing import StandardScaler
-
-            # -------------------------------------------------
-            # PERFORMANCE LIMIT
-            #
-            # Never process more than 5 minutes for speaker ID.
-            # -------------------------------------------------
-            max_seconds = 300
-
-            max_samples = int(
-                sr * max_seconds
-            )
-
-            if len(y) > max_samples:
-
-                y_speaker = y[
-                    :max_samples
-                ]
-
-            else:
-
-                y_speaker = y
-
-            # -------------------------------------------------
-            # MFCC
-            #
-            # Larger hop_length = fewer frames = much faster.
-            # -------------------------------------------------
-            mfcc = librosa.feature.mfcc(
-                y=y_speaker,
-                sr=sr,
-                n_mfcc=13,
-                hop_length=2048
-            )
-
-            if mfcc.shape[1] < 10:
-
-                return {
-                    "timeline": [],
-                    "anomalies": [],
-                    "count": 1,
-                }
-
-            # -------------------------------------------------
-            # MFCC DELTA
-            # -------------------------------------------------
-            delta = librosa.feature.delta(
-                mfcc
-            )
-
-            feat = np.vstack(
-                [
-                    mfcc,
-                    delta
-                ]
-            ).T
-
-            # -------------------------------------------------
-            # Determine number of speakers.
-            #
-            # Keep it conservative.
-            # -------------------------------------------------
-            n_sp = min(
-                4,
-                max(
-                    2,
-                    int(
-                        duration // 30
-                    )
+            "timeline": [
+                TimelineEvent(
+                    timestamp="00:00:00",
+                    source=AlertType.AUDIO,
+                    event=reason,
                 )
-            )
+            ],
 
-            # Never ask KMeans for more clusters
-            # than available samples.
-            n_sp = min(
-                n_sp,
-                len(feat)
-            )
+            "audio_anomalies": [],
 
-            if n_sp < 2:
+            "transcript": "",
 
-                return {
-                    "timeline": [],
-                    "anomalies": [],
-                    "count": 1,
-                }
+            "summary_stats": {
+                "audio_anomalies": 0,
+                "speakers_detected": 0,
+                "duration_sec": 0,
+            },
 
-            # -------------------------------------------------
-            # SCALE FEATURES
-            # -------------------------------------------------
-            X = StandardScaler().fit_transform(
-                feat
-            )
-
-            # -------------------------------------------------
-            # KMEANS
-            #
-            # n_init=3 instead of 10 for speed.
-            # -------------------------------------------------
-            labels = KMeans(
-                n_clusters=n_sp,
-                random_state=42,
-                n_init=3
-            ).fit_predict(X)
-
-            # -------------------------------------------------
-            # DETECT SPEAKER CHANGES
-            # -------------------------------------------------
-            seen = set()
-
-            hop = 2048
-
-            start = 0.0
-            prev = labels[0]
-
-            for i, lbl in enumerate(
-                labels
-            ):
-
-                if lbl != prev:
-
-                    sid = (
-                        f"SPK-{prev + 1:02d}"
-                    )
-
-                    if sid not in seen:
-
-                        seen.add(
-                            sid
-                        )
-
-                        timeline.append(
-                            TimelineEvent(
-                                timestamp=_ts(
-                                    start
-                                ),
-                                source=AlertType.AUDIO,
-                                event=(
-                                    f"Speaker "
-                                    f"{sid} identified"
-                                ),
-                            )
-                        )
-
-                        # New speaker after
-                        # the first speaker.
-                        if len(seen) > 1:
-
-                            anomalies.append(
-                                AudioAnomaly(
-                                    timestamp=_ts(
-                                        start
-                                    ),
-                                    anomaly_type=(
-                                        "new_speaker"
-                                    ),
-                                    confidence=0.65,
-                                    detail=(
-                                        f"New speaker: "
-                                        f"{sid}"
-                                    ),
-                                )
-                            )
-
-                    start = (
-                        i *
-                        hop /
-                        sr
-                    )
-
-                    prev = lbl
-
-            # Add the final speaker if one exists.
-            final_sid = (
-                f"SPK-{prev + 1:02d}"
-            )
-
-            if final_sid not in seen:
-
-                seen.add(
-                    final_sid
-                )
-
-                timeline.append(
-                    TimelineEvent(
-                        timestamp=_ts(
-                            start
-                        ),
-                        source=AlertType.AUDIO,
-                        event=(
-                            f"Speaker "
-                            f"{final_sid} identified"
-                        ),
-                    )
-                )
-
-            return {
-                "timeline": timeline,
-                "anomalies": anomalies,
-                "count": len(seen),
-            }
-
-        except Exception as e:
-
-            logger.warning(
-                f"Speaker ID failed: {e}"
-            )
-
-            return {
-                "timeline": [],
-                "anomalies": [],
-                "count": 0,
-            }
+            "capabilities":
+                self.capabilities,
+        }
