@@ -25,7 +25,7 @@ class AudioAnalyzer:
     def _load_whisper(self):
         try:
             import whisper
-            self.whisper = whisper.load_model("base")
+            self.whisper = whisper.load_model("tiny")
             self.capabilities["transcription"] = True
             logger.info("Whisper loaded")
         except Exception as e:
