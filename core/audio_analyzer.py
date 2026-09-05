@@ -1,19 +1,8 @@
-"""
-FAST Audio Analysis Engine
-Designed for low-CPU Render deployments.
 
-Principles:
-- Never process unlimited audio.
-- Audio is converted to 16 kHz mono.
-- Maximum audio analysis duration is 120 seconds.
-- Whisper tiny is loaded once per server.
-- Speaker clustering is disabled because it is too expensive on Render Free.
-- Only report real detections.
-"""
 
 import os
+import time
 import logging
-import tempfile
 import numpy as np
 from typing import Callable
 
@@ -29,14 +18,18 @@ from core.schemas import (
 logger = logging.getLogger(__name__)
 
 
-# HARD LIMIT FOR RENDER
-MAX_AUDIO_SECONDS = 120
+# ============================================================
+# HARD LIMITS
+# ============================================================
 
-# Whisper tiny is intentionally used
-WHISPER_MODEL = "tiny"
+MAX_AUDIO_SECONDS = 180          # Never analyse more than 3 minutes
+MAX_ANALYSIS_SECONDS = 240       # Absolute 4-minute safety budget
+
+WHISPER_MODEL_NAME = "tiny"
 
 
 def _ts(sec: float) -> str:
+    sec = max(0, float(sec))
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
     s = int(sec % 60)
@@ -45,9 +38,10 @@ def _ts(sec: float) -> str:
 
 class AudioAnalyzer:
 
-    # ---------------------------------------------------------
-    # LOAD WHISPER ONLY ONCE PER SERVER
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Whisper is shared between jobs.
+    # It is NOT loaded when the FastAPI server starts.
+    # --------------------------------------------------------
 
     _whisper_model = None
     _whisper_attempted = False
@@ -62,16 +56,19 @@ class AudioAnalyzer:
             "speaker_identification": False,
         }
 
-        self._load_whisper_once()
+    # ========================================================
+    # WHISPER
+    # ========================================================
 
-    def _load_whisper_once(self):
+    def _load_whisper(self):
 
         if AudioAnalyzer._whisper_attempted:
 
             self.whisper = AudioAnalyzer._whisper_model
 
-            if self.whisper is not None:
-                self.capabilities["transcription"] = True
+            self.capabilities["transcription"] = (
+                self.whisper is not None
+            )
 
             return
 
@@ -79,36 +76,39 @@ class AudioAnalyzer:
 
         try:
 
+            logger.info(
+                "Loading Whisper tiny lazily..."
+            )
+
             import whisper
 
-            logger.info("Loading Whisper tiny...")
-
             AudioAnalyzer._whisper_model = whisper.load_model(
-                WHISPER_MODEL
+                WHISPER_MODEL_NAME,
+                device="cpu"
             )
 
             self.whisper = AudioAnalyzer._whisper_model
 
             self.capabilities["transcription"] = True
 
-            logger.info("Whisper tiny loaded successfully")
+            logger.info(
+                "Whisper tiny loaded successfully"
+            )
 
         except Exception as e:
 
-            AudioAnalyzer._whisper_model = None
             self.whisper = None
 
             self.capabilities["transcription"] = False
             self.capabilities["transcription_reason"] = str(e)
 
             logger.warning(
-                "Whisper unavailable: %s",
-                e
+                f"Whisper unavailable: {e}"
             )
 
-    # ---------------------------------------------------------
+    # ========================================================
     # MAIN ANALYSIS
-    # ---------------------------------------------------------
+    # ========================================================
 
     def analyse(
         self,
@@ -116,23 +116,28 @@ class AudioAnalyzer:
         progress_cb: Callable | None = None
     ) -> dict:
 
-        import librosa
+        started = time.monotonic()
+
+        alerts = []
+        timeline = []
+        anomalies = []
+
+        transcript = ""
+
+        # ----------------------------------------------------
+        # AUDIO LOAD
+        # ----------------------------------------------------
 
         if progress_cb:
-            progress_cb(
-                62,
-                "Loading audio..."
-            )
-
-        # -----------------------------------------------------
-        # FAST AUDIO LOAD
-        # -----------------------------------------------------
+            progress_cb(62, "Loading audio...")
 
         try:
 
+            import librosa
+
             # IMPORTANT:
-            # 16 kHz mono is dramatically cheaper than
-            # preserving the original sample rate.
+            # 16 kHz mono is enough for speech/acoustic analysis.
+            # duration prevents huge files from killing Render.
 
             y, sr = librosa.load(
                 audio_path,
@@ -143,59 +148,70 @@ class AudioAnalyzer:
 
         except Exception as e:
 
-            logger.exception(
-                "Audio loading failed"
-            )
-
-            return self._empty_result(
+            logger.error(
                 f"Audio loading failed: {e}"
             )
 
-        duration = len(y) / sr
+            return {
+                "alerts": [],
+                "timeline": [],
+                "audio_anomalies": [],
+                "transcript": "",
+                "summary_stats": {
+                    "audio_anomalies": 0,
+                    "speakers_detected": 0,
+                    "duration_sec": 0,
+                },
+                "capabilities": self.capabilities,
+                "error": f"Audio loading failed: {e}",
+            }
+
+        duration = len(y) / float(sr)
+
+        if duration <= 0:
+
+            return {
+                "alerts": [],
+                "timeline": [],
+                "audio_anomalies": [],
+                "transcript": "",
+                "summary_stats": {
+                    "audio_anomalies": 0,
+                    "speakers_detected": 0,
+                    "duration_sec": 0,
+                },
+                "capabilities": self.capabilities,
+            }
 
         logger.info(
-            "Audio loaded: %.1f seconds @ %d Hz",
-            duration,
-            sr
+            f"Audio loaded: {duration:.1f}s @ {sr}Hz"
         )
 
-        alerts = []
-        timeline = []
-        anomalies = []
-
-        transcript = ""
-
-        # -----------------------------------------------------
-        # 1. GUNSHOT DETECTION
-        # -----------------------------------------------------
+        # ====================================================
+        # 1. FAST ACOUSTIC IMPULSE DETECTION
+        # ====================================================
 
         if progress_cb:
             progress_cb(
                 66,
-                "Gunshot detection..."
+                "Fast acoustic analysis..."
             )
 
-        try:
+        if not self._time_exceeded(started):
 
             gs = self._detect_impulses_fast(
                 y,
-                sr
+                sr,
+                started
             )
 
             alerts.extend(gs["alerts"])
             timeline.extend(gs["timeline"])
             anomalies.extend(gs["anomalies"])
 
-        except Exception as e:
-
-            logger.warning(
-                "Gunshot detection failed: %s",
-                e
-            )
-
-        # -----------------------------------------------------
-        # 2. WHISPER
-        # -----------------------------------------------------
+        # ====================================================
+        # 2. SPEECH TRANSCRIPTION
+        # ====================================================
 
         if progress_cb:
             progress_cb(
@@ -203,43 +219,19 @@ class AudioAnalyzer:
                 "Speech transcription..."
             )
 
-        if self.whisper:
+        # Only attempt Whisper if we still have time.
+        if not self._time_exceeded(started):
 
-            try:
-
-                transcript, speech_timeline = (
-                    self._transcribe_fast(
-                        y,
-                        sr
-                    )
-                )
-
-                timeline.extend(
-                    speech_timeline
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "Whisper failed: %s",
-                    e
-                )
-
-        else:
-
-            timeline.append(
-                TimelineEvent(
-                    timestamp="00:00:00",
-                    source=AlertType.AUDIO,
-                    event=(
-                        "[Speech transcription unavailable]"
-                    )
-                )
+            transcript, t_tl = self._transcribe_fast(
+                audio_path,
+                started
             )
 
-        # -----------------------------------------------------
-        # 3. KEYWORDS
-        # -----------------------------------------------------
+            timeline.extend(t_tl)
+
+        # ====================================================
+        # 3. KEYWORD SCAN
+        # ====================================================
 
         if progress_cb:
             progress_cb(
@@ -247,7 +239,7 @@ class AudioAnalyzer:
                 "Keyword scan..."
             )
 
-        if transcript:
+        if transcript and not self._time_exceeded(started):
 
             kw = self._keyword_scan(
                 transcript
@@ -265,194 +257,233 @@ class AudioAnalyzer:
                 kw["anomalies"]
             )
 
-        # -----------------------------------------------------
-        # 4. SPEAKER IDENTIFICATION
-        # -----------------------------------------------------
+        # ====================================================
+        # 4. NO EXPENSIVE KMEANS SPEAKER ID
+        # ====================================================
+        #
+        # KMeans over every MFCC frame was one of the biggest
+        # unnecessary CPU costs on Render Free.
+        #
+        # We deliberately do NOT run it here.
+        #
+        # This does not invent speaker identities.
+        # It simply reports that speaker identification is
+        # unavailable in the Render-optimized configuration.
+        # ====================================================
 
         if progress_cb:
             progress_cb(
                 88,
-                "Finishing audio analysis..."
+                "Finalizing audio analysis..."
             )
 
-        # DISABLED FOR FAST RENDER MODE.
-        #
-        # KMeans over every MFCC frame can become extremely
-        # expensive on CPU-only Render instances.
+        speakers_detected = 0
+
+        # ====================================================
+        # FINISH
+        # ====================================================
+
+        elapsed = time.monotonic() - started
 
         logger.info(
-            "Speaker identification skipped "
-            "in FAST mode"
+            f"Audio analysis finished in {elapsed:.1f}s"
         )
-
-        # -----------------------------------------------------
-        # RETURN
-        # -----------------------------------------------------
 
         if progress_cb:
             progress_cb(
                 94,
-                "Audio analysis complete..."
+                "Generating report..."
             )
 
         return {
-
             "alerts": alerts,
-
             "timeline": timeline,
-
             "audio_anomalies": anomalies,
-
             "transcript": transcript,
 
             "summary_stats": {
-
-                "audio_anomalies":
-                    len(anomalies),
-
-                "speakers_detected":
-                    0,
-
-                "duration_sec":
-                    round(
-                        duration,
-                        1
-                    ),
+                "audio_anomalies": len(anomalies),
+                "speakers_detected": speakers_detected,
+                "duration_sec": round(duration, 1),
+                "analysis_time_sec": round(elapsed, 1),
             },
 
-            "capabilities":
-                self.capabilities,
+            "capabilities": self.capabilities,
         }
 
-    # ---------------------------------------------------------
+    # ========================================================
+    # TIME LIMIT
+    # ========================================================
+
+    @staticmethod
+    def _time_exceeded(started):
+
+        return (
+            time.monotonic() - started
+            >= MAX_ANALYSIS_SECONDS
+        )
+
+    # ========================================================
     # FAST IMPULSE DETECTION
-    # ---------------------------------------------------------
+    # ========================================================
 
     def _detect_impulses_fast(
         self,
         y,
-        sr
+        sr,
+        started
     ):
-
-        import librosa
 
         alerts = []
         timeline = []
         anomalies = []
 
-        # Larger chunks = fewer expensive librosa calls
-        chunk_seconds = 5
-
-        chunk_samples = (
-            chunk_seconds * sr
+        # Analyse 2-second blocks.
+        chunk_seconds = 2.0
+        chunk_size = int(
+            sr * chunk_seconds
         )
 
-        n_chunks = int(
-            np.ceil(
-                len(y) /
-                chunk_samples
-            )
+        if chunk_size <= 0:
+            return {
+                "alerts": alerts,
+                "timeline": timeline,
+                "anomalies": anomalies,
+            }
+
+        # Only inspect the allowed audio.
+        total_chunks = (
+            len(y) // chunk_size
         )
 
-        for i in range(n_chunks):
+        # Avoid pathological huge loops.
+        total_chunks = min(
+            total_chunks,
+            int(MAX_AUDIO_SECONDS / chunk_seconds)
+        )
 
-            start = int(
-                i * chunk_samples
-            )
+        previous_rms = 0.0
 
-            end = int(
-                min(
-                    len(y),
-                    start + chunk_samples
+        for i in range(total_chunks):
+
+            if self._time_exceeded(started):
+                logger.warning(
+                    "Audio analysis time budget reached."
                 )
-            )
+                break
+
+            start = i * chunk_size
+            end = start + chunk_size
 
             seg = y[start:end]
 
             if len(seg) < sr * 0.25:
                 continue
 
-            t = start / sr
+            timestamp = i * chunk_seconds
+
+            # ------------------------------------------------
+            # RMS
+            # ------------------------------------------------
 
             rms = float(
                 np.sqrt(
                     np.mean(
-                        seg ** 2
-                    )
+                        np.square(seg)
+                    ) + 1e-12
                 )
             )
 
-            if rms < 1e-7:
+            if rms < 1e-6:
                 continue
 
-            db = (
-                20 *
-                np.log10(rms)
-                + 96
-            )
+            db = 20.0 * np.log10(
+                rms
+            ) + 96.0
 
-            # Cheap onset calculation
-            onset_env = (
-                librosa.onset.onset_strength(
-                    y=seg,
-                    sr=sr,
-                    hop_length=1024
+            # ------------------------------------------------
+            # Peak / crest factor
+            # ------------------------------------------------
+
+            peak = float(
+                np.max(
+                    np.abs(seg)
                 )
             )
 
-            if len(onset_env) == 0:
-                continue
-
-            peak_onset = float(
-                np.max(onset_env)
+            crest = peak / max(
+                rms,
+                1e-8
             )
 
-            # Conservative detection
-            if (
-                db >
-                settings.GUNSHOT_DB_THRESHOLD
+            # ------------------------------------------------
+            # Energy change
+            # ------------------------------------------------
+
+            energy_jump = (
+                rms /
+                max(previous_rms, rms * 0.1)
+            )
+
+            previous_rms = rms
+
+            # ------------------------------------------------
+            # Conservative impulse rule
+            #
+            # This is intentionally NOT called a confirmed
+            # gunshot. It is a possible acoustic impulse.
+            # ------------------------------------------------
+
+            possible_impulse = (
+                db >= 82.0
                 and
-                peak_onset >
-                settings.GUNSHOT_ONSET_THRESHOLD
-            ):
+                crest >= 5.0
+                and
+                energy_jump >= 1.5
+            )
 
-                conf = min(
-                    0.95,
-                    0.60
-                    +
-                    (
-                        db -
-                        settings.GUNSHOT_DB_THRESHOLD
-                    ) / 40
-                    +
-                    (
-                        peak_onset -
-                        settings.GUNSHOT_ONSET_THRESHOLD
-                    ) / 60
+            if possible_impulse:
+
+                confidence = 0.55
+
+                if db >= 90:
+                    confidence += 0.10
+
+                if crest >= 7:
+                    confidence += 0.10
+
+                if energy_jump >= 2.5:
+                    confidence += 0.10
+
+                confidence = min(
+                    0.85,
+                    confidence
                 )
 
                 severity = (
                     SeverityLevel.HIGH
-                    if conf > 0.80
+                    if confidence >= 0.75
                     else SeverityLevel.MEDIUM
                 )
 
-                timestamp = _ts(t)
+                ts = _ts(timestamp)
 
                 alerts.append(
                     Alert(
-                        timestamp=timestamp,
+                        timestamp=ts,
                         severity=severity,
                         alert_type=AlertType.AUDIO,
-                        category="gunshot_detected",
+                        category="acoustic_impulse",
                         description=(
-                            f"Possible acoustic impulse "
-                            f"at {timestamp} "
+                            f"Possible acoustic impulse at "
+                            f"{ts} "
                             f"(dB {db:.1f}, "
-                            f"confidence {conf:.0%})"
+                            f"crest {crest:.1f}, "
+                            f"confidence "
+                            f"{confidence:.0%})"
                         ),
                         confidence=round(
-                            conf,
+                            confidence,
                             2
                         ),
                     )
@@ -460,15 +491,14 @@ class AudioAnalyzer:
 
                 timeline.append(
                     TimelineEvent(
-                        timestamp=timestamp,
+                        timestamp=ts,
                         source=AlertType.AUDIO,
                         event=(
-                            f"Acoustic impulse — "
-                            f"possible gunshot "
-                            f"({conf:.0%})"
+                            f"Acoustic impulse detected "
+                            f"({confidence:.0%})"
                         ),
                         confidence=round(
-                            conf,
+                            confidence,
                             2
                         ),
                     )
@@ -476,15 +506,36 @@ class AudioAnalyzer:
 
                 anomalies.append(
                     AudioAnomaly(
-                        timestamp=timestamp,
-                        anomaly_type="gunshot",
+                        timestamp=ts,
+                        anomaly_type="acoustic_impulse",
                         confidence=round(
-                            conf,
+                            confidence,
                             2
                         ),
                         detail=(
                             f"dB:{db:.1f} "
-                            f"onset:{peak_onset:.1f}"
+                            f"crest:{crest:.1f}"
+                        ),
+                    )
+                )
+
+            # ------------------------------------------------
+            # Loud sustained audio
+            # ------------------------------------------------
+
+            elif (
+                db >= 80.0
+                and crest < 5.0
+            ):
+
+                anomalies.append(
+                    AudioAnomaly(
+                        timestamp=_ts(timestamp),
+                        anomaly_type="elevated_audio",
+                        confidence=0.50,
+                        detail=(
+                            f"Sustained loud audio "
+                            f"(dB {db:.1f})"
                         ),
                     )
                 )
@@ -495,34 +546,75 @@ class AudioAnalyzer:
             "anomalies": anomalies,
         }
 
-    # ---------------------------------------------------------
+    # ========================================================
     # FAST WHISPER
-    # ---------------------------------------------------------
+    # ========================================================
 
     def _transcribe_fast(
         self,
-        y,
-        sr
+        path,
+        started
     ):
 
         timeline = []
 
+        # Load model lazily.
+        self._load_whisper()
+
         if self.whisper is None:
+
+            timeline.append(
+                TimelineEvent(
+                    timestamp="00:00:00",
+                    source=AlertType.AUDIO,
+                    event=(
+                        "[Speech transcription "
+                        "unavailable]"
+                    ),
+                )
+            )
+
+            return "", timeline
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Render Free CPU is extremely limited.
+        # Don't let Whisper consume the entire job forever.
+        # ----------------------------------------------------
+
+        if self._time_exceeded(started):
+
+            logger.warning(
+                "Skipping Whisper: time budget reached."
+            )
+
             return "", timeline
 
         try:
 
-            # Whisper accepts a numpy waveform.
-            # No temporary MP3/WAV conversion required.
+            logger.info(
+                "Starting Whisper tiny transcription..."
+            )
 
             result = self.whisper.transcribe(
-                y,
+                path,
+
                 language="en",
+
                 fp16=False,
+
                 temperature=0,
-                verbose=False,
+
                 condition_on_previous_text=False,
-                word_timestamps=False
+
+                word_timestamps=False,
+
+                verbose=False,
+
+                # Keep decoding conservative.
+                beam_size=1,
+
+                best_of=1,
             )
 
             text = (
@@ -531,49 +623,76 @@ class AudioAnalyzer:
                 .strip()
             )
 
+            # ------------------------------------------------
+            # Segment timeline
+            # ------------------------------------------------
+
             for seg in result.get(
                 "segments",
                 []
             ):
 
-                no_speech = seg.get(
-                    "no_speech_prob",
-                    1.0
+                if self._time_exceeded(started):
+                    break
+
+                no_speech = float(
+                    seg.get(
+                        "no_speech_prob",
+                        1.0
+                    )
                 )
 
                 if no_speech < 0.5:
 
-                    timeline.append(
-                        TimelineEvent(
-                            timestamp=_ts(
-                                seg["start"]
-                            ),
-                            source=AlertType.AUDIO,
-                            event=(
-                                "Speech: "
-                                f'"{seg["text"].strip()}"'
-                            ),
-                            confidence=round(
-                                1 - no_speech,
-                                2
-                            ),
+                    timestamp = _ts(
+                        seg.get(
+                            "start",
+                            0
                         )
                     )
+
+                    segment_text = (
+                        seg.get(
+                            "text",
+                            ""
+                        )
+                        .strip()
+                    )
+
+                    if segment_text:
+
+                        timeline.append(
+                            TimelineEvent(
+                                timestamp=timestamp,
+                                source=AlertType.AUDIO,
+                                event=(
+                                    f'Speech: '
+                                    f'"{segment_text}"'
+                                ),
+                                confidence=round(
+                                    1.0 - no_speech,
+                                    2
+                                ),
+                            )
+                        )
+
+            logger.info(
+                "Whisper transcription completed."
+            )
 
             return text, timeline
 
         except Exception as e:
 
-            logger.warning(
-                "Whisper transcription failed: %s",
-                e
+            logger.error(
+                f"Whisper transcription failed: {e}"
             )
 
             return "", timeline
 
-    # ---------------------------------------------------------
-    # KEYWORD SCAN
-    # ---------------------------------------------------------
+    # ========================================================
+    # KEYWORD DETECTION
+    # ========================================================
 
     def _keyword_scan(
         self,
@@ -584,31 +703,55 @@ class AudioAnalyzer:
         timeline = []
         anomalies = []
 
-        words = set(
-            transcript.lower().split()
+        text = (
+            transcript
+            .lower()
         )
 
-        matched = [
-            kw
-            for kw in settings.THREAT_KEYWORDS
-            if kw.lower() in words
-        ]
+        words = set(
+            text.split()
+        )
+
+        matched = []
+
+        for keyword in settings.THREAT_KEYWORDS:
+
+            keyword = (
+                str(keyword)
+                .lower()
+                .strip()
+            )
+
+            if not keyword:
+                continue
+
+            if keyword in words:
+                matched.append(
+                    keyword
+                )
 
         if matched:
 
-            n = len(matched)
-
-            severity = (
-                SeverityLevel.HIGH
-                if n >= 4
-                else SeverityLevel.MEDIUM
-                if n >= 2
-                else SeverityLevel.LOW
+            count = len(
+                matched
             )
 
+            if count >= 4:
+                severity = SeverityLevel.HIGH
+            elif count >= 2:
+                severity = SeverityLevel.MEDIUM
+            else:
+                severity = SeverityLevel.LOW
+
             confidence = min(
-                0.92,
-                0.50 + n * 0.10
+                0.90,
+                0.50 + count * 0.10
+            )
+
+            description = (
+                "Threat keywords found "
+                "in verified transcript: "
+                + ", ".join(matched)
             )
 
             alerts.append(
@@ -617,11 +760,11 @@ class AudioAnalyzer:
                     severity=severity,
                     alert_type=AlertType.AUDIO,
                     category="keyword_alert",
-                    description=(
-                        "Threat keywords in transcript: "
-                        + ", ".join(matched)
+                    description=description,
+                    confidence=round(
+                        confidence,
+                        2
                     ),
-                    confidence=confidence,
                 )
             )
 
@@ -633,6 +776,10 @@ class AudioAnalyzer:
                         "Keywords matched: "
                         + ", ".join(matched)
                     ),
+                    confidence=round(
+                        confidence,
+                        2
+                    ),
                 )
             )
 
@@ -640,9 +787,13 @@ class AudioAnalyzer:
                 AudioAnomaly(
                     timestamp="00:00:00",
                     anomaly_type="keyword",
-                    confidence=confidence,
+                    confidence=round(
+                        confidence,
+                        2
+                    ),
                     detail=(
-                        f"Matched {n} keyword(s): "
+                        f"Matched {count} "
+                        f"keyword(s): "
                         + ", ".join(matched)
                     ),
                 )
@@ -652,39 +803,4 @@ class AudioAnalyzer:
             "alerts": alerts,
             "timeline": timeline,
             "anomalies": anomalies,
-        }
-
-    # ---------------------------------------------------------
-    # EMPTY RESULT
-    # ---------------------------------------------------------
-
-    def _empty_result(
-        self,
-        reason
-    ):
-
-        return {
-
-            "alerts": [],
-
-            "timeline": [
-                TimelineEvent(
-                    timestamp="00:00:00",
-                    source=AlertType.AUDIO,
-                    event=reason,
-                )
-            ],
-
-            "audio_anomalies": [],
-
-            "transcript": "",
-
-            "summary_stats": {
-                "audio_anomalies": 0,
-                "speakers_detected": 0,
-                "duration_sec": 0,
-            },
-
-            "capabilities":
-                self.capabilities,
         }
